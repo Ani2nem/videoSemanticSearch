@@ -1,0 +1,28 @@
+grpcio>=1.62.0
+grpcio-tools>=1.62.0
+protobuf>=4.25.0
+pydantic>=2.6.0
+langchain>=0.1.0
+langchain-openai>=0.1.0
+langchain-core>=0.1.0
+openai>=1.14.0
+
+# Core vision/audio (lighter versions)
+mediapipe>=0.10.0
+Pillow>=10.0.0
+numpy>=1.26.0
+ultralytics>=8.1.0
+faster-whisper>=1.0.0
+
+# For OCR - using easyocr instead of paddleocr (much easier to install)
+easyocr>=1.7.0
+
+# Hair color/texture analysis
+scikit-learn>=1.4.0
+opencv-python>=4.9.0
+transformers>=4.38.0
+torch>=2.2.0
+
+# Testing
+pytest>=8.0.0
+pytest-asyncio>=0.23.0

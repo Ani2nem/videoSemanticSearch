@@ -1,0 +1,25 @@
+syntax = "proto3";
+
+package mcp;
+
+// Shared request message used by all five MCP servers.
+// Carries raw bytes (image or audio) and metadata for tracing.
+message FeatureRequest {
+  bytes payload = 1;         // image bytes or audio bytes
+  string payload_type = 2;   // "image" or "audio"
+  string source_id = 3;      // video/thumbnail identifier for tracing
+}
+
+// Shared response message returned by all five MCP servers.
+// result_json contains the feature-specific payload as a JSON string.
+message FeatureResponse {
+  string result_json = 1;    // each MCP returns a JSON string
+  float confidence = 2;
+  bool success = 3;
+  string error_message = 4;
+}
+
+// Single unified service contract implemented by every MCP server.
+service MCPService {
+  rpc ExtractFeatures(FeatureRequest) returns (FeatureResponse);
+}
