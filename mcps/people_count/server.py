@@ -7,8 +7,11 @@ Port: 50053
 Responsibility: Accept an image payload and return a count of people detected
 using Ultralytics YOLOv8.
 
-Model: yolov8n.pt (nano — fast, ~6 MB). The model is downloaded automatically
-by Ultralytics on first run and cached in ~/.cache/ultralytics/.
+Model: yolov8n.pt (nano — fast, ~6 MB). Auto-downloaded on first run.
+
+Known limitation: heavily overlapping bodies (e.g. people stacked in bed) and
+tight side-profile pairs may be merged into one detection by NMS. Revisit with
+a domain-specific model when accuracy tuning pass begins.
 
 Usage (standalone):
     python -m mcps.people_count.server
@@ -38,7 +41,6 @@ except ImportError as exc:
 try:
     from PIL import Image
     from ultralytics import YOLO  # type: ignore
-
     _YOLO_AVAILABLE = True
 except ImportError:
     _YOLO_AVAILABLE = False
@@ -57,41 +59,25 @@ if not _YOLO_AVAILABLE:
         "Install with: pip install ultralytics Pillow"
     )
 
-# Lazy-loaded YOLO model singleton
 _yolo_model: Any = None
+_PERSON_CLASS_ID = 0
 
 
 def _get_yolo():
-    """Load yolov8n.pt once and reuse across requests."""
     global _yolo_model  # noqa: PLW0603
     if _yolo_model is None and _YOLO_AVAILABLE:
         _yolo_model = YOLO("yolov8n.pt")
         logger.info("YOLOv8n model loaded")
     return _yolo_model
 
-# YOLO class index for "person" in COCO
-_PERSON_CLASS_ID = 0
-
 
 class PeopleCountServicer(mcp_pb2_grpc.MCPServiceServicer):
-    """
-    Implements MCPService.ExtractFeatures for people counting.
-
-    Input  : FeatureRequest.payload — raw JPEG/PNG image bytes
-    Output : FeatureResponse.result_json — JSON with keys:
-               "people_count"   (int)        — number of persons detected
-               "bounding_boxes" (int)        — alias for people_count (one box per person)
-               "detections"     (list[dict]) — [{x1,y1,x2,y2,confidence}, ...]
-               "using_mock"     (bool)
-    """
-
     async def ExtractFeatures(
         self,
         request: mcp_pb2.FeatureRequest,
         context: grpc.aio.ServicerContext,
     ) -> mcp_pb2.FeatureResponse:
-        logger.info("Received request source_id=%s payload_type=%s",
-                    request.source_id, request.payload_type)
+        logger.info("Received request source_id=%s", request.source_id)
 
         if request.payload_type != "image":
             await context.abort(
@@ -122,33 +108,16 @@ class PeopleCountServicer(mcp_pb2_grpc.MCPServiceServicer):
 
 
 async def _count_people(image_bytes: bytes) -> dict:
-    """Offload CPU-bound YOLO inference to a thread executor."""
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, _count_people_sync, image_bytes)
 
 
 def _count_people_sync(image_bytes: bytes) -> dict:
-    """
-    Synchronous people-counting using YOLOv8.
-
-    Steps:
-        1. Decode image bytes to a PIL Image
-        2. Run YOLO inference (class filter: person)
-        3. Collect bounding boxes and per-detection confidence scores
-        4. Return summary dict
-
-    Mock fallback (when ultralytics unavailable):
-        Returns stub data with using_mock=True.
-
-    TODO: For higher accuracy on dense crowds, swap yolov8n.pt for:
-          - yolov8m.pt or yolov8l.pt (larger models)
-          - or a crowd-counting specialist model (e.g. CSRNet, BayesCrowd)
-    """
     if not _YOLO_AVAILABLE:
         return {
             "data": {
                 "people_count": 2,
-                "bounding_boxes": 2,
+                "scene_type": "duo",
                 "detections": [],
                 "using_mock": True,
             },
@@ -157,7 +126,7 @@ def _count_people_sync(image_bytes: bytes) -> dict:
 
     model = _get_yolo()
     image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    results = model(image, classes=[_PERSON_CLASS_ID], verbose=False)
+    results = model(image, classes=[_PERSON_CLASS_ID], conf=0.35, iou=0.45, verbose=False)
 
     detections = []
     for result in results:
@@ -168,15 +137,16 @@ def _count_people_sync(image_bytes: bytes) -> dict:
 
     count = len(detections)
     avg_conf = (sum(d["confidence"] for d in detections) / count) if count else 0.0
+    scene_type = "solo" if count == 1 else "duo" if count == 2 else "group" if count >= 3 else "none"
 
     return {
         "data": {
             "people_count": count,
-            "bounding_boxes": count,
+            "scene_type": scene_type,
             "detections": detections,
             "using_mock": False,
         },
-        "confidence": avg_conf if count else 0.90,  # 0.90 = high confidence of "zero people"
+        "confidence": avg_conf if count else 0.90,
     }
 
 

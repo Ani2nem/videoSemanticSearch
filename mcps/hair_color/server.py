@@ -418,17 +418,13 @@ def _hybrid_color(
 # ---------------------------------------------------------------------------
 
 _SHORT_HAIR_PIXEL_THRESH = 15_000
-_STRAIGHT_SHORT_BOOST    = 0.05   # reduced — model already over-predicts Straight
+_STRAIGHT_SHORT_BOOST    = 0.0   # disabled — retrained model handles this
 
 _LONG_HAIR_PIXEL_THRESH  = 25_000
-_WAVY_LONG_BOOST         = 0.28   # increased from 0.18 — Wavy severely underdetected
-_CURLY_LONG_BOOST        = 0.08   # slight bump too
+_WAVY_LONG_BOOST         = 0.0   # disabled — retrained model handles this
+_CURLY_LONG_BOOST        = 0.0   # disabled — retrained model handles this
 
-# Tightened from 0.18 — blends only when the model is genuinely ambiguous
-_BLEND_GAP               = 0.12   # slightly relaxed from 0.10 to allow Straight-Wavy blends
-
-# Pixel counts above this are synthetic (set by face_crop_fallback) and must
-# not trigger short/long hair boosts — real hair regions top out ~200k px.
+_BLEND_GAP               = 0.12
 _BOOST_PIXEL_CAP         = 500_000
 
 _TEXTURE_CLASS_NAMES = ["Bald", "Curly", "Dreadlocks", "Straight", "Wavy"]
@@ -454,45 +450,43 @@ _BLEND_ORDER         = ["Straight", "Wavy", "Curly"]
 #   - If Straight is always winning  → decrease Straight scale
 # ---------------------------------------------------------------------------
 
-_TEMPERATURE       = 1.8   # flatten logit distribution
+_TEMPERATURE       = 1.0   # no temperature scaling needed — model trained with balanced classes
 
 _CLASS_PRIOR_SCALE = {
-    "Bald":       1.60,   # heavily boost — model raw Bald score is ~0.05-0.12 even for bald people
-    "Curly":      1.40,
-    "Dreadlocks": 1.10,
-    "Straight":   0.50,   # aggressively penalise
-    "Wavy":       1.60,   # match Bald boost — most commonly missed texture class
+    "Bald":       1.0,
+    "Curly":      1.0,
+    "Dreadlocks": 1.0,
+    "Straight":   1.0,
+    "Wavy":       1.0,
 }
 
-# Bald detection: if hair pixels / face bounding box area < this ratio,
-# override the model and return Bald regardless of what it predicts.
-# Pitbull: 10118 hair px, face bbox ~(fw*fh) typically 200x200=40000 → ratio 0.25
-# A real-haired person: 30k-300k px over same face area → ratio >> 0.5
-_BALD_PIXEL_RATIO_THRESH  = 0.35
-_BALD_PIXEL_HARD_THRESH   = 12_000   # also force Bald if raw pixel count is tiny
+# Bald hard threshold — only trigger when hair pixels are extremely low
+# (below this, even the model can't distinguish Bald from sparse hair).
+# The retrained model handles Bald detection via its own scores for
+# normal cases — we only override here for near-zero pixel counts.
+# Set deliberately low to avoid false positives on close-up shots.
+_BALD_PIXEL_HARD_THRESH = 3_000
 
 
 def _texture_classify(
     masked_crop: Image.Image,
     hair_pixel_count: int,
-    face_area: int = 0,
+    face_area: int = 0,  # kept for API compatibility, no longer used internally
 ) -> tuple[str, list[str], float]:
     global _TEXTURE_MODEL, _TEXTURE_DEVICE, _TEXTURE_TRANSFORM
     if _TEXTURE_MODEL is None:
         _load_texture_model()
 
-    # --- Bald ratio gate ---
-    # If the segmenter found very few hair pixels relative to face size,
-    # the person is bald. Don't bother running EfficientNet.
-    if face_area > 0:
-        ratio = hair_pixel_count / face_area
+    # Hard Bald gate — only for truly near-zero hair pixel counts.
+    # The ratio gate was removed because face bbox area varies wildly
+    # with shot distance (close-up = huge bbox = low ratio even with
+    # lots of hair). The retrained model handles normal Bald cases.
+    if hair_pixel_count < _BALD_PIXEL_HARD_THRESH:
         logger.info(
-            "Bald gate: hair_px=%d  face_area=%d  ratio=%.3f  thresh=%.2f",
-            hair_pixel_count, face_area, ratio, _BALD_PIXEL_RATIO_THRESH,
+            "Bald hard gate: hair_px=%d < %d → Bald",
+            hair_pixel_count, _BALD_PIXEL_HARD_THRESH,
         )
-        if ratio < _BALD_PIXEL_RATIO_THRESH or hair_pixel_count < _BALD_PIXEL_HARD_THRESH:
-            logger.info("Bald gate triggered → Bald")
-            return "Bald", ["Bald"], 0.85
+        return "Bald", ["Bald"], 0.85
 
     img_tensor = (
         _TEXTURE_TRANSFORM(masked_crop.convert("RGB"))

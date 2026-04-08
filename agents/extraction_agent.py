@@ -65,6 +65,7 @@ MCP_ADDRESSES: dict[str, str] = {
     "people_count": "localhost:50053",
     "captions":     "localhost:50054",
     "audio":        "localhost:50055",
+    "race":         "localhost:50056",
 }
 
 # payload_type per MCP
@@ -74,6 +75,7 @@ MCP_PAYLOAD_TYPES: dict[str, str] = {
     "people_count": "image",
     "captions":     "image",
     "audio":        "audio",
+    "race":         "image",
 }
 
 # Which MCPs are hard dependencies (failure → raise ExtractionError)
@@ -254,17 +256,18 @@ class ExtractionAgent:
 
         bundle = ExtractionBundle(source_id=source_id)
 
-        # Fan out to all 5 MCPs concurrently
+        # Fan out to all MCPs concurrently
         results = await asyncio.gather(
             self._call_mcp("hair_color",   image_bytes, source_id),
             self._call_mcp("body_build",   image_bytes, source_id),
             self._call_mcp("people_count", image_bytes, source_id),
             self._call_mcp("captions",     image_bytes, source_id),
             self._call_mcp("audio",        audio_bytes, source_id),
+            self._call_mcp("race",         image_bytes, source_id),
             return_exceptions=True,
         )
 
-        mcp_names = ["hair_color", "body_build", "people_count", "captions", "audio"]
+        mcp_names = ["hair_color", "body_build", "people_count", "captions", "audio", "race"]
         for name, outcome in zip(mcp_names, results):
             if isinstance(outcome, Exception):
                 if isinstance(outcome, ServerOfflineError):

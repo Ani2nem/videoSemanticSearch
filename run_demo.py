@@ -87,6 +87,7 @@ def _print_extraction_flags(bundle) -> None:
         ("people_count", flags.people_count),
         ("captions",     flags.captions),
         ("audio",        flags.audio),
+        ("race",         flags.race),
     ]
     for name, ok in rows:
         status = "OK" if ok else "FAILED"
@@ -166,12 +167,24 @@ async def main() -> None:
             if hc:
                 ppl = hc.get("people", [])
                 dom_lab = ppl[0].get("dominant_lab", "?") if ppl else "?"
-                print(f"  DEBUG - People detected: {len(ppl)}"
+                print(f"  DEBUG hair  - People: {len(ppl)}"
                       f" | color={hc.get('dominant_color', '?')}"
                       f" | texture={hc.get('dominant_texture', '?')}"
                       f" | Lab={dom_lab}")
             else:
-                print("  DEBUG - People detected: 0 (hair_color MCP unavailable)")
+                print("  DEBUG hair  - unavailable")
+
+            rc = bundle.race
+            if rc:
+                main = rc.get("main_actress_race", "?")
+                actresses = rc.get("actress_races", [])
+                actors = rc.get("actor_races", [])
+                print(f"  DEBUG race  - People: {rc.get('count', 0)}"
+                      f" | main_actress={main}"
+                      f" | actresses={actresses}"
+                      f" | actors={actors}")
+            else:
+                print("  DEBUG race  - unavailable")
             print(f"\n  Raw MCP data for '{image_path.name}':")
             print(bundle.model_dump_json(indent=4))
 
