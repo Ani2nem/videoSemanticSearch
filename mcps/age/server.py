@@ -1,31 +1,22 @@
 """
-mcps/race/server.py
+mcps/age/server.py
 
-Async gRPC MCP server — Race/Ethnicity + Gender feature extraction.
-Port: 50056
+Async gRPC MCP server — Age Range feature extraction.
+Port: 50057
 
-Responsibility: Detect race/ethnicity and gender for every face in a thumbnail.
-Identifies each person as "actress" (female) or "actor" (male) and flags the
-main actress — the largest-face female in the frame.
+Responsibility: Detect age range for every face in a thumbnail.
+Reports the main actress age (largest-face female) first in the output.
 
 Stack (zero new installs — everything already in the venv):
-  Face detection   : OpenCV Haar cascade (haarcascade_frontalface_default.xml)
-                     Built into opencv-python, no download required.
-  Race classifier  : dima806/fairface_race_image_detection  (HuggingFace ViT)
-  Gender classifier: rizvandwiki/gender-classification  (HuggingFace ViT)
-  Both HuggingFace models auto-download and cache on first run (~350 MB total).
+  Face detection : OpenCV Haar cascade (haarcascade_frontalface_default.xml)
+  Age classifier : openai/clip-vit-large-patch14 (already cached from race MCP)
 
-Known limitation: Haar cascade is front-face biased — pure side profiles may
-be missed. Revisit with a better detector when accuracy tuning begins.
+Age ranges : 18-25, 26-35, 36-45, 46+
 
-Race labels : White, Black, Indian, East Asian, Southeast Asian,
-              Middle Eastern, Latino_Hispanic
-Gender      : Male → "actor" | Female → "actress"
-
-Output ordering: main actress is always people[0] and actress_races[0].
+Output ordering: main actress is always people[0] and main_actress_age.
 
 Usage (standalone):
-    python -m mcps.race.server
+    python -m mcps.age.server
 """
 
 from __future__ import annotations
@@ -66,11 +57,11 @@ except ImportError:
 
 _AVAILABLE = _CV2_AVAILABLE and _CLIP_AVAILABLE
 
-PORT = 50056
+PORT = 50057
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [race] %(levelname)s %(message)s",
+    format="%(asctime)s [age] %(levelname)s %(message)s",
 )
 logger = logging.getLogger(__name__)
 
@@ -83,85 +74,54 @@ if not _CLIP_AVAILABLE:
 # CLIP zero-shot classifier
 # ---------------------------------------------------------------------------
 
-# Use the large model — significantly better accuracy than clip-vit-base-patch32
 _CLIP_MODEL_ID = "openai/clip-vit-large-patch14"
 
-# Template ensembling: multiple prompts per class are averaged in embedding space
-# before scoring. This is the technique from the original CLIP paper and
-# significantly boosts accuracy over single-prompt zero-shot.
-_RACE_TEMPLATES: list[list[str]] = [
-    # White
+# Template ensembling: multiple prompts per age range averaged in embedding space.
+_AGE_TEMPLATES: list[list[str]] = [
+    # 18-25
     [
-        "a photo of a white caucasian person",
-        "a white european person's face",
-        "a person with light skin and caucasian features",
+        "a photo of a young adult woman in her early 20s",
+        "a college-aged woman's face",
+        "a woman who looks 18 to 25 years old",
     ],
-    # Black
+    # 26-35
     [
-        "a photo of a black person",
-        "an african american person's face",
-        "a person with dark skin and african features",
+        "a photo of a woman in her late 20s or early 30s",
+        "a young professional woman's face",
+        "a woman who looks 26 to 35 years old",
     ],
-    # East Asian
+    # 36-45
     [
-        "a photo of an east asian person",
-        "a chinese, japanese, or korean person's face",
-        "a person with east asian facial features",
+        "a photo of a middle-aged woman in her 40s",
+        "a mature woman's face with some age lines",
+        "a woman who looks 36 to 45 years old",
     ],
-    # South Asian
+    # 46+
     [
-        "a photo of a south asian person",
-        "an indian or pakistani person's face",
-        "a person with south asian facial features",
-    ],
-    # Middle Eastern
-    [
-        "a photo of a middle eastern person",
-        "an arab person's face",
-        "a person with middle eastern facial features",
-    ],
-    # Latino Hispanic
-    [
-        "a photo of a hispanic or latino person",
-        "a latin american person's face",
-        "a person with hispanic facial features",
-    ],
-    # Southeast Asian
-    [
-        "a photo of a southeast asian person",
-        "a thai, vietnamese, or filipino person's face",
-        "a person with southeast asian facial features",
+        "a photo of an older woman over 45",
+        "a senior woman's face",
+        "a woman who looks 46 years old or older",
     ],
 ]
-_RACE_KEYS = ["White", "Black", "East Asian", "South Asian", "Middle Eastern", "Latino Hispanic", "Southeast Asian"]
+_AGE_KEYS = ["18-25", "26-35", "36-45", "46+"]
 
+# Gender templates — used to identify main actress (same approach as race MCP)
 _GENDER_TEMPLATES: list[list[str]] = [
-    # Woman
-    [
-        "a photo of a woman",
-        "a female person's face",
-        "a woman's face",
-    ],
-    # Man
-    [
-        "a photo of a man",
-        "a male person's face",
-        "a man's face",
-    ],
+    ["a photo of a woman", "a female person's face", "a woman's face"],
+    ["a photo of a man",   "a male person's face",  "a man's face"],
 ]
 _GENDER_KEYS = ["Woman", "Man"]
 
 _clip_model: Any = None
 _clip_processor: Any = None
-# Pre-computed text embeddings, shape [n_classes, embed_dim]; built once on load.
-_race_text_embeds: Any = None
+_age_text_embeds: Any = None
 _gender_text_embeds: Any = None
 
 
 def _get_clip():
     global _clip_model, _clip_processor  # noqa: PLW0603
     if _clip_model is None and _CLIP_AVAILABLE:
-        logger.info("Loading CLIP model %s (first run may download ~1.7 GB) …", _CLIP_MODEL_ID)
+        logger.info("Loading CLIP model %s (already cached from race MCP) …", _CLIP_MODEL_ID)
         _clip_model     = CLIPModel.from_pretrained(_CLIP_MODEL_ID)
         _clip_processor = CLIPProcessor.from_pretrained(_CLIP_MODEL_ID)
         _clip_model.eval()
@@ -171,55 +131,47 @@ def _get_clip():
 
 def _build_text_embeds(templates: list[list[str]]) -> "torch.Tensor":
     """
-    For each class, encode all its prompt variants and average + L2-normalise
-    the resulting embeddings. This is the ensembling technique from the CLIP paper.
-    Returns a tensor of shape [n_classes, embed_dim].
+    For each class, encode all prompt variants and average + L2-normalise.
+    Returns tensor of shape [n_classes, embed_dim].
     """
     model, processor = _get_clip()
     class_embeds = []
     for prompts in templates:
         inputs = processor(text=prompts, return_tensors="pt", padding=True)
         with torch.no_grad():
-            raw = model.text_model(**inputs)
-            # Use the internal text_model + projection to stay version-agnostic.
-            # get_text_features() changed return type across transformers versions.
-            embeds = model.text_projection(raw.pooler_output)  # [n_prompts, embed_dim]
-        embeds = embeds / embeds.norm(dim=-1, keepdim=True)    # L2 normalise
-        embeds = embeds.mean(dim=0)                            # average
-        embeds = embeds / embeds.norm()                        # re-normalise
+            raw    = model.text_model(**inputs)
+            embeds = model.text_projection(raw.pooler_output)
+        embeds = embeds / embeds.norm(dim=-1, keepdim=True)
+        embeds = embeds.mean(dim=0)
+        embeds = embeds / embeds.norm()
         class_embeds.append(embeds)
-    return torch.stack(class_embeds)   # [n_classes, embed_dim]
+    return torch.stack(class_embeds)
 
 
 def _ensure_embeds() -> None:
-    global _race_text_embeds, _gender_text_embeds  # noqa: PLW0603
-    if _race_text_embeds is None:
+    global _age_text_embeds, _gender_text_embeds  # noqa: PLW0603
+    if _age_text_embeds is None:
         logger.info("Building ensembled text embeddings …")
-        _race_text_embeds   = _build_text_embeds(_RACE_TEMPLATES)
+        _age_text_embeds    = _build_text_embeds(_AGE_TEMPLATES)
         _gender_text_embeds = _build_text_embeds(_GENDER_TEMPLATES)
         logger.info("Text embeddings ready")
 
 
-def _clip_classify(face_crop: Image.Image, text_embeds: "torch.Tensor", keys: list[str]) -> tuple[str, float]:
-    """
-    Classify a face crop against pre-built ensembled text embeddings.
-    Returns (top_key, confidence).
-    """
+def _clip_classify(face_crop: "Image.Image", text_embeds: "torch.Tensor", keys: list[str]) -> tuple[str, float]:
+    """Classify a face crop against pre-built embeddings. Returns (top_key, confidence)."""
     model, processor = _get_clip()
     inputs = processor(images=face_crop, return_tensors="pt")
     with torch.no_grad():
-        raw = model.vision_model(**inputs)
+        raw       = model.vision_model(**inputs)
         img_embed = model.visual_projection(raw.pooler_output)
     img_embed = img_embed / img_embed.norm(dim=-1, keepdim=True)
-    # Cosine similarities → softmax probabilities
-    sims    = (img_embed @ text_embeds.T).squeeze(0)   # [n_classes]
+    sims    = (img_embed @ text_embeds.T).squeeze(0)
     probs   = (sims * model.logit_scale.exp()).softmax(dim=0)
     top_idx = int(probs.argmax())
     return keys[top_idx], round(float(probs[top_idx].detach()), 4)
 
 
 def _warm_up() -> None:
-    """Pre-load CLIP and build ensembled text embeddings before the first request."""
     _get_clip()
     _ensure_embeds()
 
@@ -228,7 +180,7 @@ def _warm_up() -> None:
 # gRPC Servicer
 # ---------------------------------------------------------------------------
 
-class RaceServicer(mcp_pb2_grpc.MCPServiceServicer):
+class AgeServicer(mcp_pb2_grpc.MCPServiceServicer):
 
     async def ExtractFeatures(
         self,
@@ -240,7 +192,7 @@ class RaceServicer(mcp_pb2_grpc.MCPServiceServicer):
         if request.payload_type != "image":
             await context.abort(
                 grpc.StatusCode.INVALID_ARGUMENT,
-                f"race MCP expects payload_type='image', got '{request.payload_type}'",
+                f"age MCP expects payload_type='image', got '{request.payload_type}'",
             )
 
         if not request.payload:
@@ -278,9 +230,9 @@ def _analyze_sync(image_bytes: bytes) -> dict:
     """
     1. Decode image → PIL RGB + OpenCV greyscale
     2. Haar cascade: detect frontal faces → bounding boxes
-    3. For each face crop: CLIP large zero-shot → race + gender
-    4. Assign role (actress/actor), find main actress (largest female face)
-    5. Return structured result with main actress first
+    3. For each face crop: CLIP large zero-shot → gender + age range
+    4. Find main actress (largest female face), place her first
+    5. Return structured result
     """
     if not _AVAILABLE:
         return _mock_result()
@@ -298,8 +250,8 @@ def _analyze_sync(image_bytes: bytes) -> dict:
         minSize=(40, 40),
     )
 
-    # Drop detections smaller than 2% of the image area — almost always
-    # background texture false positives, not real faces.
+    # Drop detections smaller than 2% of the image area — these are almost
+    # always background texture false positives, not real faces.
     img_w, img_h = image_pil.size
     min_area = 0.02 * img_w * img_h
     if len(raw_faces) > 0:
@@ -311,9 +263,7 @@ def _analyze_sync(image_bytes: bytes) -> dict:
             "data": {
                 "people": [],
                 "count": 0,
-                "main_actress_race": None,
-                "actress_races": [],
-                "actor_races": [],
+                "main_actress_age": None,
                 "using_mock": False,
             },
             "confidence": 0.0,
@@ -326,8 +276,6 @@ def _analyze_sync(image_bytes: bytes) -> dict:
     _ensure_embeds()
 
     for idx, (x, y, w, h) in enumerate(raw_faces, start=1):
-        # Pad the bounding box by 30% so CLIP gets skin tone + surrounding
-        # context, not just the tight face oval.
         pad = int(max(w, h) * 0.30)
         x1 = max(0, int(x) - pad)
         y1 = max(0, int(y) - pad)
@@ -337,25 +285,24 @@ def _analyze_sync(image_bytes: bytes) -> dict:
         face_crop = image_pil.crop((x1, y1, x2, y2))
 
         try:
-            race_label,   race_conf   = _clip_classify(face_crop, _race_text_embeds,   _RACE_KEYS)
             gender_label, gender_conf = _clip_classify(face_crop, _gender_text_embeds, _GENDER_KEYS)
+            age_label,    age_conf    = _clip_classify(face_crop, _age_text_embeds,    _AGE_KEYS)
         except Exception:
             logger.exception("CLIP classification failed for face %d", idx)
-            race_label, race_conf     = "unknown", 0.0
             gender_label, gender_conf = "unknown", 0.0
+            age_label,    age_conf    = "unknown", 0.0
 
         role = "actress" if gender_label == "Woman" else "actor"
 
         people.append({
-            "person_id":         idx,
-            "role":              role,
-            "is_main_actress":   False,
-            "race":              race_label,
-            "race_confidence":   race_conf,
-            "gender":            gender_label,
+            "person_id":        idx,
+            "role":             role,
+            "is_main_actress":  False,
+            "age_range":        age_label,
+            "age_confidence":   age_conf,
+            "gender":           gender_label,
             "gender_confidence": gender_conf,
-            "face_region":       {"x": x1, "y": y1, "w": x2 - x1, "h": y2 - y1},
-            "_area":             (x2 - x1) * (y2 - y1),
+            "_area":            (x2 - x1) * (y2 - y1),
         })
 
     if not people:
@@ -363,9 +310,7 @@ def _analyze_sync(image_bytes: bytes) -> dict:
             "data": {
                 "people": [],
                 "count": 0,
-                "main_actress_race": None,
-                "actress_races": [],
-                "actor_races": [],
+                "main_actress_age": None,
                 "using_mock": False,
             },
             "confidence": 0.0,
@@ -376,12 +321,11 @@ def _analyze_sync(image_bytes: bytes) -> dict:
     if actresses:
         main = max(actresses, key=lambda p: p["_area"])
         main["is_main_actress"] = True
-        main_actress_race = main["race"]
+        main_actress_age = main["age_range"]
     else:
-        main_actress_race = None
+        main_actress_age = None
 
-    # Sort people so main actress is first (index 0), then other actresses,
-    # then actors — makes the main actress immediately accessible to callers.
+    # Sort: main actress first, then other actresses, then actors
     def _sort_key(p: dict) -> int:
         if p.get("is_main_actress"):
             return 0
@@ -391,22 +335,16 @@ def _analyze_sync(image_bytes: bytes) -> dict:
 
     people.sort(key=_sort_key)
 
-    # actress_races: main actress first, then remaining actresses in order
-    actress_races = [p["race"] for p in people if p["role"] == "actress"]
-    actor_races   = [p["race"] for p in people if p["role"] == "actor"]
-
     for p in people:
         p.pop("_area", None)
 
-    avg_conf = sum(p["race_confidence"] for p in people) / len(people)
+    avg_conf = sum(p["age_confidence"] for p in people) / len(people)
 
     return {
         "data": {
             "people":           people,
             "count":            len(people),
-            "main_actress_race": main_actress_race,
-            "actress_races":    actress_races,
-            "actor_races":      actor_races,
+            "main_actress_age": main_actress_age,
             "using_mock":       False,
         },
         "confidence": round(avg_conf, 4),
@@ -418,20 +356,17 @@ def _mock_result() -> dict:
         "data": {
             "people": [
                 {
-                    "person_id":        1,
-                    "role":             "actress",
-                    "is_main_actress":  True,
-                    "race":             "White",
-                    "race_confidence":  0.85,
-                    "gender":           "Woman",
-                    "gender_confidence": 0.92,
-                    "face_region":      {"x": 0, "y": 0, "w": 0, "h": 0},
+                    "person_id":         1,
+                    "role":              "actress",
+                    "is_main_actress":   True,
+                    "age_range":         "26-35",
+                    "age_confidence":    0.70,
+                    "gender":            "Woman",
+                    "gender_confidence": 0.90,
                 }
             ],
             "count":            1,
-            "main_actress_race": "White",
-            "actress_races":    ["White"],
-            "actor_races":      [],
+            "main_actress_age": "26-35",
             "using_mock":       True,
         },
         "confidence": 0.50,
@@ -443,11 +378,9 @@ def _mock_result() -> dict:
 # ---------------------------------------------------------------------------
 
 async def serve() -> None:
-    # Warm up DeepFace on startup so model downloads happen before the first
-    # real request, and any download failures are immediately visible in logs.
     if _AVAILABLE:
         loop = asyncio.get_running_loop()
-        logger.info("Loading CLIP model (first run downloads ~1.7 GB) …")
+        logger.info("Loading CLIP model (already cached from race MCP) …")
         try:
             await loop.run_in_executor(None, _warm_up)
             logger.info("CLIP model ready")
@@ -458,12 +391,12 @@ async def serve() -> None:
             )
 
     server = grpc.aio.server()
-    mcp_pb2_grpc.add_MCPServiceServicer_to_server(RaceServicer(), server)
+    mcp_pb2_grpc.add_MCPServiceServicer_to_server(AgeServicer(), server)
     listen_addr = f"[::]:{PORT}"
     server.add_insecure_port(listen_addr)
-    logger.info("race MCP server starting on %s", listen_addr)
+    logger.info("age MCP server starting on %s", listen_addr)
     await server.start()
-    logger.info("race MCP server ready")
+    logger.info("age MCP server ready")
     await server.wait_for_termination()
 
 

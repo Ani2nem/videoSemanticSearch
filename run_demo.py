@@ -88,6 +88,7 @@ def _print_extraction_flags(bundle) -> None:
         ("captions",     flags.captions),
         ("audio",        flags.audio),
         ("race",         flags.race),
+        ("age",          flags.age),
     ]
     for name, ok in rows:
         status = "OK" if ok else "FAILED"
@@ -185,6 +186,16 @@ async def main() -> None:
                       f" | actors={actors}")
             else:
                 print("  DEBUG race  - unavailable")
+
+            ag = bundle.age
+            if ag:
+                main_age = ag.get("main_actress_age", "?")
+                ppl_ages = [(p.get("role", "?"), p.get("age_range", "?")) for p in ag.get("people", [])]
+                print(f"  DEBUG age   - People: {ag.get('count', 0)}"
+                      f" | main_actress={main_age}"
+                      f" | all={ppl_ages}")
+            else:
+                print("  DEBUG age   - unavailable")
             print(f"\n  Raw MCP data for '{image_path.name}':")
             print(bundle.model_dump_json(indent=4))
 

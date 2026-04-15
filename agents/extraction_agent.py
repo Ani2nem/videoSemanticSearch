@@ -66,6 +66,7 @@ MCP_ADDRESSES: dict[str, str] = {
     "captions":     "localhost:50054",
     "audio":        "localhost:50055",
     "race":         "localhost:50056",
+    "age":          "localhost:50057",
 }
 
 # payload_type per MCP
@@ -76,6 +77,7 @@ MCP_PAYLOAD_TYPES: dict[str, str] = {
     "captions":     "image",
     "audio":        "audio",
     "race":         "image",
+    "age":          "image",
 }
 
 # Which MCPs are hard dependencies (failure → raise ExtractionError)
@@ -264,10 +266,11 @@ class ExtractionAgent:
             self._call_mcp("captions",     image_bytes, source_id),
             self._call_mcp("audio",        audio_bytes, source_id),
             self._call_mcp("race",         image_bytes, source_id),
+            self._call_mcp("age",          image_bytes, source_id),
             return_exceptions=True,
         )
 
-        mcp_names = ["hair_color", "body_build", "people_count", "captions", "audio", "race"]
+        mcp_names = ["hair_color", "body_build", "people_count", "captions", "audio", "race", "age"]
         for name, outcome in zip(mcp_names, results):
             if isinstance(outcome, Exception):
                 if isinstance(outcome, ServerOfflineError):
@@ -310,10 +313,14 @@ class ExtractionAgent:
         """
         cb = self._circuit_breakers[mcp_name]
 
-        # Circuit is open — fail immediately without hitting the server
+        # Circuit is open — fail immediately without hitting the server.
+        # Raise ServerOfflineError so callers treat this as a soft infrastructure
+        # failure, not a data error (same as when the server is unreachable).
         if cb.is_open():
-            raise RuntimeError(
-                f"Circuit breaker for '{mcp_name}' is OPEN — skipping call"
+            raise ServerOfflineError(
+                mcp_name,
+                grpc.StatusCode.UNAVAILABLE,
+                "Circuit breaker is OPEN — server was consistently offline",
             )
 
         address      = self._addresses[mcp_name]

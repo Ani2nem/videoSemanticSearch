@@ -22,6 +22,7 @@ class PartialFlags(BaseModel):
     captions: bool = True
     audio: bool = True
     race: bool = True
+    age: bool = True
 
 
 class ExtractionBundle(BaseModel):
@@ -55,5 +56,6 @@ class ExtractionBundle(BaseModel):
     captions: dict | None = None
     audio: dict | None = None
     race: dict | None = None
+    age: dict | None = None
     partial_flags: PartialFlags = Field(default_factory=PartialFlags)
     extraction_errors: dict[str, str] = Field(default_factory=dict)
