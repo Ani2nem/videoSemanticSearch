@@ -12,17 +12,15 @@ Features
     • Opens after 5 consecutive failures
     • Half-open probe fires after 30 s
     • Closes on successful probe; resets timer on failed probe
-- Soft dependencies (hair_color, body_build, people_count): failure yields a
-  partial ExtractionBundle (partial_flags[name]=False, error logged)
-- Hard dependencies (captions, audio): failure raises ExtractionError,
-  aborting the bundle for that source
+- All dependencies are soft: failure yields a partial ExtractionBundle
+  (partial_flags[name]=False, error logged); pipeline never aborts mid-batch
 
 Usage
 -----
     from agents.extraction_agent import ExtractionAgent
     agent = ExtractionAgent()
     bundles = await agent.process([
-        {"source_id": "clip_001", "image_path": "samples/frame.jpg", "audio_path": "samples/clip.wav"},
+        {"source_id": "clip_001", "image_path": "samples/frame.jpg"},
     ])
 """
 
@@ -63,8 +61,6 @@ MCP_ADDRESSES: dict[str, str] = {
     "hair_color":   "localhost:50051",
     "body_build":   "localhost:50052",
     "people_count": "localhost:50053",
-    "captions":     "localhost:50054",
-    "audio":        "localhost:50055",
     "race":         "localhost:50056",
     "age":          "localhost:50057",
 }
@@ -74,14 +70,9 @@ MCP_PAYLOAD_TYPES: dict[str, str] = {
     "hair_color":   "image",
     "body_build":   "image",
     "people_count": "image",
-    "captions":     "image",
-    "audio":        "audio",
     "race":         "image",
     "age":          "image",
 }
-
-# Which MCPs are hard dependencies (failure → raise ExtractionError)
-HARD_DEPENDENCIES: frozenset[str] = frozenset({"captions", "audio"})
 
 # Retry parameters
 MAX_RETRIES = 2
@@ -233,7 +224,6 @@ class ExtractionAgent:
         Each input dict must contain:
             source_id  : str
             image_path : str | Path  (can be empty string if no image)
-            audio_path : str | Path  (can be empty string if no audio)
 
         Raises ExtractionError if a hard-dependency MCP fails on any input.
         """
@@ -251,10 +241,8 @@ class ExtractionAgent:
     async def _process_one(self, inp: dict[str, Any]) -> ExtractionBundle:
         source_id  = inp["source_id"]
         image_path = Path(inp.get("image_path", "") or "")
-        audio_path = Path(inp.get("audio_path", "") or "")
 
         image_bytes = image_path.read_bytes() if image_path.is_file() else b""
-        audio_bytes = audio_path.read_bytes() if audio_path.is_file() else b""
 
         bundle = ExtractionBundle(source_id=source_id)
 
@@ -263,19 +251,15 @@ class ExtractionAgent:
             self._call_mcp("hair_color",   image_bytes, source_id),
             self._call_mcp("body_build",   image_bytes, source_id),
             self._call_mcp("people_count", image_bytes, source_id),
-            self._call_mcp("captions",     image_bytes, source_id),
-            self._call_mcp("audio",        audio_bytes, source_id),
             self._call_mcp("race",         image_bytes, source_id),
             self._call_mcp("age",          image_bytes, source_id),
             return_exceptions=True,
         )
 
-        mcp_names = ["hair_color", "body_build", "people_count", "captions", "audio", "race", "age"]
+        mcp_names = ["hair_color", "body_build", "people_count", "race", "age"]
         for name, outcome in zip(mcp_names, results):
             if isinstance(outcome, Exception):
                 if isinstance(outcome, ServerOfflineError):
-                    # Server is unreachable — always a soft failure regardless of
-                    # dependency type. Record "Server Offline" and keep going.
                     bundle.extraction_errors[name] = "Server Offline"
                     setattr(bundle.partial_flags, name, False)
                     logger.warning(
@@ -285,10 +269,6 @@ class ExtractionAgent:
                     error_msg = str(outcome)
                     bundle.extraction_errors[name] = error_msg
                     setattr(bundle.partial_flags, name, False)
-
-                    if name in HARD_DEPENDENCIES:
-                        raise ExtractionError(source_id, name, error_msg)
-
                     logger.warning(
                         "[%s] soft-dep '%s' failed → partial result. Error: %s",
                         source_id, name, error_msg,

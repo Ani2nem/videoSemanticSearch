@@ -55,6 +55,12 @@ try:
 except ImportError:
     _CLIP_AVAILABLE = False
 
+try:
+    from ultralytics import YOLO  # type: ignore
+    _YOLO_AVAILABLE = True
+except ImportError:
+    _YOLO_AVAILABLE = False
+
 _AVAILABLE = _CV2_AVAILABLE and _CLIP_AVAILABLE
 
 PORT = 50057
@@ -116,6 +122,16 @@ _clip_model: Any = None
 _clip_processor: Any = None
 _age_text_embeds: Any = None
 _gender_text_embeds: Any = None
+_yolo_model: Any = None
+_PERSON_CLASS_ID = 0
+
+
+def _get_yolo():
+    global _yolo_model  # noqa: PLW0603
+    if _yolo_model is None and _YOLO_AVAILABLE:
+        _yolo_model = YOLO("yolov8n.pt")
+        logger.info("YOLOv8n loaded for age MCP")
+    return _yolo_model
 
 
 def _get_clip():
@@ -174,6 +190,8 @@ def _clip_classify(face_crop: "Image.Image", text_embeds: "torch.Tensor", keys: 
 def _warm_up() -> None:
     _get_clip()
     _ensure_embeds()
+    if _YOLO_AVAILABLE:
+        _get_yolo()
 
 
 # ---------------------------------------------------------------------------
@@ -228,36 +246,78 @@ async def _analyze(image_bytes: bytes) -> dict:
 
 def _analyze_sync(image_bytes: bytes) -> dict:
     """
-    1. Decode image → PIL RGB + OpenCV greyscale
-    2. Haar cascade: detect frontal faces → bounding boxes
-    3. For each face crop: CLIP large zero-shot → gender + age range
-    4. Find main actress (largest female face), place her first
-    5. Return structured result
+    1. YOLO: detect person bounding boxes (more reliable than Haar in group shots).
+    2. For each person crop: run Haar within the crop (face is proportionally larger).
+       Fallback: use top 35% of the person crop as a face proxy for side profiles.
+    3. If YOLO unavailable/finds nothing: fall back to global Haar detection.
+    4. For each face region: CLIP large zero-shot → gender + age range.
+    5. Find main actress (largest female face), place her first.
+    6. Return structured result.
     """
     if not _AVAILABLE:
         return _mock_result()
 
     image_pil = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     image_np  = np.array(image_pil)
-    gray      = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
+    img_w, img_h = image_pil.size
 
     cascade_path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
     cascade      = cv2.CascadeClassifier(cascade_path)
-    raw_faces    = cascade.detectMultiScale(
-        gray,
-        scaleFactor=1.05,
-        minNeighbors=5,
-        minSize=(40, 40),
-    )
 
-    # Drop detections smaller than 2% of the image area — these are almost
-    # always background texture false positives, not real faces.
-    img_w, img_h = image_pil.size
-    min_area = 0.02 * img_w * img_h
-    if len(raw_faces) > 0:
-        raw_faces = [(x, y, w, h) for (x, y, w, h) in raw_faces if w * h >= min_area]
+    # face_regions: list of (x1, y1, x2, y2) in global image coordinates.
+    face_regions: list[tuple[int, int, int, int]] = []
 
-    if len(raw_faces) == 0:
+    if _YOLO_AVAILABLE:
+        yolo = _get_yolo()
+        yolo_results = yolo(image_pil, classes=[_PERSON_CLASS_ID], conf=0.35, iou=0.45, verbose=False)
+        person_boxes = []
+        for result in yolo_results:
+            for box in result.boxes:
+                px1, py1, px2, py2 = [int(v) for v in box.xyxy[0].tolist()]
+                person_boxes.append((px1, py1, px2, py2))
+
+        if person_boxes:
+            logger.info("YOLO detected %d person(s)", len(person_boxes))
+            for (px1, py1, px2, py2) in person_boxes:
+                pw = px2 - px1
+                ph = py2 - py1
+                person_np = image_np[py1:py2, px1:px2]
+                gray_crop = cv2.cvtColor(person_np, cv2.COLOR_RGB2GRAY)
+
+                local_faces = cascade.detectMultiScale(
+                    gray_crop,
+                    scaleFactor=1.05,
+                    minNeighbors=3,
+                    minSize=(20, 20),
+                )
+
+                if len(local_faces) > 0:
+                    min_crop_area = 0.005 * pw * ph
+                    local_faces = [
+                        (x, y, w, h) for (x, y, w, h) in local_faces
+                        if w * h >= min_crop_area
+                    ]
+
+                if len(local_faces) > 0:
+                    # Cast to int: Haar returns numpy int32, which JSON can't serialize.
+                    x, y, w, h = max(local_faces, key=lambda f: f[2] * f[3])
+                    face_regions.append((px1 + int(x), py1 + int(y), px1 + int(x) + int(w), py1 + int(y) + int(h)))
+                else:
+                    proxy_y2 = py1 + max(10, int(ph * 0.35))
+                    face_regions.append((px1, py1, px2, proxy_y2))
+
+    if not face_regions:
+        gray      = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
+        raw_faces = cascade.detectMultiScale(
+            gray, scaleFactor=1.05, minNeighbors=5, minSize=(40, 40),
+        )
+        min_area = 0.02 * img_w * img_h
+        if len(raw_faces) > 0:
+            raw_faces = [(x, y, w, h) for (x, y, w, h) in raw_faces if w * h >= min_area]
+        for (x, y, w, h) in raw_faces:
+            face_regions.append((int(x), int(y), int(x + w), int(y + h)))
+
+    if not face_regions:
         logger.info("No faces detected")
         return {
             "data": {
@@ -269,18 +329,20 @@ def _analyze_sync(image_bytes: bytes) -> dict:
             "confidence": 0.0,
         }
 
-    logger.info("Detected %d face(s)", len(raw_faces))
+    logger.info("Processing %d face region(s)", len(face_regions))
 
     people = []
 
     _ensure_embeds()
 
-    for idx, (x, y, w, h) in enumerate(raw_faces, start=1):
-        pad = int(max(w, h) * 0.30)
-        x1 = max(0, int(x) - pad)
-        y1 = max(0, int(y) - pad)
-        x2 = min(img_w, int(x + w) + pad)
-        y2 = min(img_h, int(y + h) + pad)
+    for idx, (rx1, ry1, rx2, ry2) in enumerate(face_regions, start=1):
+        rw = rx2 - rx1
+        rh = ry2 - ry1
+        pad = int(max(rw, rh) * 0.30)
+        x1 = max(0, rx1 - pad)
+        y1 = max(0, ry1 - pad)
+        x2 = min(img_w, rx2 + pad)
+        y2 = min(img_h, ry2 + pad)
 
         face_crop = image_pil.crop((x1, y1, x2, y2))
 

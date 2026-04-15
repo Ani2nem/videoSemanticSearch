@@ -19,8 +19,6 @@ class PartialFlags(BaseModel):
     hair_color: bool = True
     body_build: bool = True
     people_count: bool = True
-    captions: bool = True
-    audio: bool = True
     race: bool = True
     age: bool = True
 
@@ -43,9 +41,13 @@ class ExtractionBundle(BaseModel):
                         then mapped to the nearest named color.
                         Texture is classified by SigLIP on a mask-filtered crop.
     body_build        : JSON-decoded dict from the body_build MCP, or None on failure.
+                        Structure: {"people": [...], "count": n}
+                        Each "people" entry: {person_id, body_build, confidence}
+                        Uses YOLO to crop each detected person, then CLIP zero-shot per crop.
+                        Falls back to classifying the full image (person_id=1) if YOLO finds nobody.
     people_count      : JSON-decoded dict from the people_count MCP, or None on failure.
-    captions          : JSON-decoded dict from the captions MCP, or None on failure.
-    audio             : JSON-decoded dict from the audio MCP, or None on failure.
+    race              : JSON-decoded dict from the race MCP, or None on failure.
+    age               : JSON-decoded dict from the age MCP, or None on failure.
     partial_flags     : Boolean success flags per MCP.
     extraction_errors : Maps MCP name → human-readable error string for any failures.
     """
@@ -53,8 +55,6 @@ class ExtractionBundle(BaseModel):
     hair_color: dict | None = None
     body_build: dict | None = None
     people_count: dict | None = None
-    captions: dict | None = None
-    audio: dict | None = None
     race: dict | None = None
     age: dict | None = None
     partial_flags: PartialFlags = Field(default_factory=PartialFlags)

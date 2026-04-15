@@ -39,14 +39,14 @@ def _mock_extraction_bundle() -> ExtractionBundle:
         hair_color={"dominant_color": "black", "palette": ["black"]},
         body_build={"body_build": "athletic", "landmarks_used": 20, "using_mock": False},
         people_count={"people_count": 1, "bounding_boxes": 1, "detections": [], "using_mock": False},
-        captions={"text_lines": ["Hello World"], "line_count": 1, "raw_results": [], "using_mock": False},
-        audio={"transcript": "Test audio", "language": "en", "language_prob": 0.99, "segments": [], "using_mock": False},
+        race={"main_actress_race": "unknown", "count": 1, "using_mock": False},
+        age={"main_actress_age": "26-35", "count": 1, "people": [], "using_mock": False},
         partial_flags=PartialFlags(
             hair_color=True,
             body_build=True,
             people_count=True,
-            captions=True,
-            audio=True,
+            race=True,
+            age=True,
         ),
         extraction_errors={},
     )
@@ -56,9 +56,9 @@ def _mock_llm_json_response() -> str:
     """A valid JSON string the mocked LLM will return."""
     return json.dumps({
         "description": "A single athletic person with black hair speaking in English.",
-        "tags": ["person", "athletic", "black-hair", "english", "caption"],
+        "tags": ["person", "athletic", "black-hair"],
         "confidence_score": 0.92,
-        "dominant_features": ["hair_color", "body_build", "audio_transcript"],
+        "dominant_features": ["hair_color", "body_build", "race"],
     })
 
 

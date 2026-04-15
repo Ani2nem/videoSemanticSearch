@@ -4,27 +4,21 @@ run_demo.py
 Full pipeline demo — ExtractionAgent → ConsolidationAgent.
 
 Discovers all images (.jpg / .jpeg / .png, case-insensitive) in samples/,
-then runs the full extraction + consolidation pipeline for each one, using
-samples/clip.wav as the shared audio source.
+then runs the full extraction + consolidation pipeline for each one.
 
 Prerequisites
 -------------
 1. Generate proto stubs (from project root):
        python -m grpc_tools.protoc -I./proto --python_out=. --grpc_python_out=. ./proto/mcp.proto
 
-2. Start all five MCP servers in separate terminals:
-       python -m mcps.hair_color.server
-       python -m mcps.body_build.server
-       python -m mcps.people_count.server
-       python -m mcps.captions.server
-       python -m mcps.audio.server
+2. Start all five MCP servers (or use start_mcps.py):
+       python start_mcps.py
 
 3. Set your OpenAI API key (not required when using --mock):
        export OPENAI_API_KEY=sk-...
 
 4. Place sample files:
        samples/<any>.jpg|jpeg|png  — one or more images (video frames work well)
-       samples/clip.wav            — a short audio clip (16 kHz mono WAV recommended)
 
 Usage
 -----
@@ -33,6 +27,16 @@ Usage
 """
 
 from __future__ import annotations
+
+# Re-exec with the venv Python if we're not already running inside it.
+# Compares sys.prefix (the active Python env) against the project venv dir.
+# This means `python3 run_demo.py` works without activating the venv first.
+import sys
+from pathlib import Path as _Path
+_venv_dir = _Path(__file__).parent / "venv"
+if _venv_dir.exists() and _Path(sys.prefix).resolve() != _venv_dir.resolve():
+    import os
+    os.execv(str(_venv_dir / "bin" / "python3"), [str(_venv_dir / "bin" / "python3")] + sys.argv)
 
 # Suppress Pydantic/LangChain UserWarning noise on Python 3.14
 import warnings
@@ -48,14 +52,13 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from agents.consolidation_agent import ConsolidationAgent, MockConsolidationAgent
-from agents.extraction_agent import ExtractionAgent, ExtractionError
+from agents.extraction_agent import ExtractionAgent
 
 
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-SAMPLES_DIR  = Path(__file__).parent / "samples"
-SAMPLE_AUDIO = SAMPLES_DIR / "clip.wav"
+SAMPLES_DIR = Path(__file__).parent / "samples"
 
 # Set to True to print raw MCP extraction data for every image without calling
 # the consolidation agent (and without requiring OPENAI_API_KEY).
@@ -79,25 +82,138 @@ def _print_header(text: str, width: int = 60) -> None:
     print("=" * width)
 
 
-def _print_extraction_flags(bundle) -> None:
-    flags = bundle.partial_flags
-    rows = [
-        ("hair_color",   flags.hair_color),
-        ("body_build",   flags.body_build),
-        ("people_count", flags.people_count),
-        ("captions",     flags.captions),
-        ("audio",        flags.audio),
-        ("race",         flags.race),
-        ("age",          flags.age),
-    ]
-    for name, ok in rows:
-        status = "OK" if ok else "FAILED"
-        print(f"        {name:<14}: {status}")
+def _conf(value: float, low_threshold: float = 0.5) -> str:
+    """Format a confidence value; append a warning marker if below threshold."""
+    pct = f"{value:.0%}"
+    return pct if value >= low_threshold else f"{pct} ⚠"
 
+
+def _print_bundle_summary(bundle) -> None:
+    """
+    Print a clean, human-readable extraction summary.
+
+    Strips internal noise (bounding boxes, LAB values, color_method,
+    face_region coords, using_mock flags) and surfaces:
+      - Scene-level info (scene type, people count, body build)
+      - Per-person hair, race, age — cross-referenced by person_id
+      - Count-mismatch warnings when MCPs disagree
+      - Low-confidence warnings (< 50%)
+      - MCP online/offline status on a single line
+    Works correctly when any MCPs are offline.
+    """
+    flags = bundle.partial_flags
+
+    # ── Scene line ──────────────────────────────────────────────────────────
+    scene_parts: list[str] = []
+
+    if bundle.people_count and flags.people_count:
+        pc = bundle.people_count
+        scene_parts.append(
+            f"scene: {pc.get('scene_type', '?')}  |  "
+            f"YOLO people: {pc.get('people_count', '?')}"
+        )
+    else:
+        scene_parts.append("scene: OFFLINE")
+
+    print("  " + "   |   ".join(scene_parts))
+
+    # ── Body Build ───────────────────────────────────────────────────────────
+    if bundle.body_build and flags.body_build:
+        bb_people = bundle.body_build.get("people", [])
+        print(f"\n  Body Build  ({len(bb_people)} person{'s' if len(bb_people) != 1 else ''} detected)")
+        for p in bb_people:
+            print(f"    #{p.get('person_id', '?')}  {p.get('body_build', '?')}   ({_conf(p.get('confidence', 0))})")
+    else:
+        print("\n  Body Build  OFFLINE")
+
+    # ── Hair ────────────────────────────────────────────────────────────────
+    if bundle.hair_color and flags.hair_color:
+        people = bundle.hair_color.get("people", [])
+        print(f"\n  Hair  ({len(people)} person{'s' if len(people) != 1 else ''} detected)")
+        for p in people:
+            color   = p.get("dominant_color", "?")
+            texture = p.get("dominant_texture", "?")
+            c_conf  = p.get("color_confidence", 0)
+            t_conf  = p.get("texture_confidence", 0)
+            occ     = "  [occluded]" if p.get("occluded") else ""
+            note    = f"  [{p['note']}]" if p.get("note") else ""
+            print(
+                f"    #{p.get('person_id', '?')}  {color}, {texture}{occ}"
+                f"   color: {_conf(c_conf)}  texture: {_conf(t_conf)}{note}"
+            )
+    else:
+        print("\n  Hair    OFFLINE")
+
+    # ── Race & Age (same face detector — show together) ─────────────────────
+    race_ok = bool(bundle.race and flags.race)
+    age_ok  = bool(bundle.age  and flags.age)
+
+    race_people: list[dict] = bundle.race.get("people", []) if race_ok else []
+    age_people:  list[dict] = bundle.age.get("people",  []) if age_ok  else []
+    face_count = bundle.race.get("count", 0) if race_ok else (
+                 bundle.age.get("count",  0) if age_ok  else None)
+
+    # Cross-reference by person_id
+    race_by_id = {p["person_id"]: p for p in race_people}
+    age_by_id  = {p["person_id"]: p for p in age_people}
+    person_ids = sorted(set(list(race_by_id) + list(age_by_id)))
+
+    # Count-mismatch warning
+    hair_count = len(bundle.hair_color.get("people", [])) if (bundle.hair_color and flags.hair_color) else None
+    mismatch = (
+        hair_count is not None
+        and face_count is not None
+        and hair_count != face_count
+    )
+    mismatch_note = f"  ⚠ hair detected {hair_count}" if mismatch else ""
+
+    if race_ok or age_ok:
+        face_label = "?" if face_count is None else face_count
+        print(f"\n  Race & Age  ({face_label} face{'s' if face_count != 1 else ''} detected){mismatch_note}")
+        if not person_ids:
+            print("    (no faces detected)")
+        else:
+            for pid in person_ids:
+                rp = race_by_id.get(pid, {})
+                ap = age_by_id.get(pid, {})
+                role      = rp.get("role") or ap.get("role", "?")
+                gender    = rp.get("gender", "?")
+                race      = rp.get("race", "?") if rp else "?"
+                r_conf    = rp.get("race_confidence", 0)
+                age_range = ap.get("age_range", "?") if ap else "?"
+                a_conf    = ap.get("age_confidence", 0)
+                is_main   = rp.get("is_main_actress") or ap.get("is_main_actress")
+                main_tag  = "  [MAIN]" if is_main else ""
+
+                race_str = f"{race} ({_conf(r_conf)})" if rp else "race: OFFLINE"
+                age_str  = f"{age_range} ({_conf(a_conf)})" if ap else "age: OFFLINE"
+
+                print(f"    #{pid}  {gender}, {race_str}, {age_str}{main_tag}  [{role}]")
+    else:
+        print("\n  Race & Age  OFFLINE")
+
+    # Main actress summary (if present)
+    if race_ok:
+        main_race = bundle.race.get("main_actress_race")
+        if main_race:
+            main_age = bundle.age.get("main_actress_age", "?") if age_ok else "?"
+            print(f"  → Main actress: {main_race}, {main_age}")
+
+    # ── MCP status line ──────────────────────────────────────────────────────
+    def _s(flag: bool, name: str) -> str:
+        return f"✓ {name}" if flag else f"✗ {name}"
+
+    status_line = "  ".join([
+        _s(flags.hair_color,   "hair_color"),
+        _s(flags.body_build,   "body_build"),
+        _s(flags.people_count, "people_count"),
+        _s(flags.race,         "race"),
+        _s(flags.age,          "age"),
+    ])
     if bundle.extraction_errors:
-        print("\n      Extraction errors:")
-        for mcp, err in bundle.extraction_errors.items():
-            print(f"        {mcp}: {err}")
+        errs = "  |  ".join(f"{k}: {v}" for k, v in bundle.extraction_errors.items())
+        print(f"\n  Errors: {errs}")
+    print(f"\n  MCPs: {status_line}")
 
 
 async def main() -> None:
@@ -109,13 +225,8 @@ async def main() -> None:
     )
     args = parser.parse_args()
     # -----------------------------------------------------------------------
-    # Validate shared audio file and discover images before doing any work.
+    # Discover images before doing any work.
     # -----------------------------------------------------------------------
-    if not SAMPLE_AUDIO.exists():
-        print(f"[ERROR] Audio file not found: {SAMPLE_AUDIO}")
-        print("  Place a WAV audio clip at samples/clip.wav and retry.")
-        sys.exit(1)
-
     images = _discover_images(SAMPLES_DIR)
     if not images:
         print(f"[ERROR] No images found in {SAMPLES_DIR}")
@@ -125,7 +236,6 @@ async def main() -> None:
     _print_header("Video Insight Engine — Batch Demo")
     mode_label = "DRY RUN (extraction only)" if DRY_RUN else ("MOCK (no LLM)" if args.mock else "LIVE (GPT-4o-mini)")
     print(f"\n  Mode   : {mode_label}")
-    print(f"  Audio  : {SAMPLE_AUDIO}")
     print(f"  Images : {len(images)} file(s) found in {SAMPLES_DIR}")
     for img in images:
         print(f"           • {img.name}")
@@ -155,52 +265,16 @@ async def main() -> None:
                 {
                     "source_id":  source_id,
                     "image_path": str(image_path),
-                    "audio_path": str(SAMPLE_AUDIO),
                 }
             ]
 
             # Step 2 — Run ExtractionAgent (all 5 MCPs in parallel).
-            print(f"\n  [1/2] Extraction  →  source_id='{source_id}'")
+            print(f"\n  Extraction  →  source_id='{source_id}'")
             bundles = await extraction_agent.process(extraction_input)
             bundle  = bundles[0]
-            _print_extraction_flags(bundle)
-            hc = bundle.hair_color
-            if hc:
-                ppl = hc.get("people", [])
-                dom_lab = ppl[0].get("dominant_lab", "?") if ppl else "?"
-                print(f"  DEBUG hair  - People: {len(ppl)}"
-                      f" | color={hc.get('dominant_color', '?')}"
-                      f" | texture={hc.get('dominant_texture', '?')}"
-                      f" | Lab={dom_lab}")
-            else:
-                print("  DEBUG hair  - unavailable")
-
-            rc = bundle.race
-            if rc:
-                main = rc.get("main_actress_race", "?")
-                actresses = rc.get("actress_races", [])
-                actors = rc.get("actor_races", [])
-                print(f"  DEBUG race  - People: {rc.get('count', 0)}"
-                      f" | main_actress={main}"
-                      f" | actresses={actresses}"
-                      f" | actors={actors}")
-            else:
-                print("  DEBUG race  - unavailable")
-
-            ag = bundle.age
-            if ag:
-                main_age = ag.get("main_actress_age", "?")
-                ppl_ages = [(p.get("role", "?"), p.get("age_range", "?")) for p in ag.get("people", [])]
-                print(f"  DEBUG age   - People: {ag.get('count', 0)}"
-                      f" | main_actress={main_age}"
-                      f" | all={ppl_ages}")
-            else:
-                print("  DEBUG age   - unavailable")
-            print(f"\n  Raw MCP data for '{image_path.name}':")
-            print(bundle.model_dump_json(indent=4))
+            _print_bundle_summary(bundle)
 
             if DRY_RUN:
-                print(f"\n  [DRY RUN] Skipping consolidation for '{image_path.name}'.")
                 continue
 
             # Step 3 — Run ConsolidationAgent (GPT-4o-mini or mock).
@@ -219,9 +293,6 @@ async def main() -> None:
             print(f"\n  Full ConsolidatedOutput:")
             print(json.dumps(output.model_dump(), indent=4, ensure_ascii=False))
 
-        except ExtractionError as exc:
-            # Hard-dependency MCP failure — log and continue to the next image.
-            print(f"\n  [SKIP] ExtractionError for '{image_path.name}': {exc}")
         except Exception as exc:  # noqa: BLE001
             # Any other unexpected error — log and continue.
             print(f"\n  [ERROR] Unexpected error for '{image_path.name}': {exc}")
@@ -230,7 +301,7 @@ async def main() -> None:
     # Final batch summary.
     # -----------------------------------------------------------------------
     _print_header("Batch complete")
-    print(f"  Processed {len(images)} image(s) with audio: {SAMPLE_AUDIO.name}\n")
+    print(f"  Processed {len(images)} image(s)\n")
 
 
 if __name__ == "__main__":

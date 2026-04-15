@@ -20,10 +20,8 @@ Note: Tests require the protobuf stubs to be generated first:
 from __future__ import annotations
 
 import asyncio
-import io
 import json
 import struct
-import wave
 import pytest
 import pytest_asyncio
 
@@ -33,11 +31,9 @@ import grpc.aio
 import mcp_pb2
 import mcp_pb2_grpc
 
-from mcps.hair_color.server   import HairColorServicer
+from mcps.hair_color.server   import HairAnalysisServicer
 from mcps.body_build.server   import BodyBuildServicer
 from mcps.people_count.server import PeopleCountServicer
-from mcps.captions.server     import CaptionsServicer
-from mcps.audio.server        import AudioServicer
 
 
 # ---------------------------------------------------------------------------
@@ -65,18 +61,6 @@ def _minimal_png_bytes() -> bytes:
     return signature + ihdr + idat + iend
 
 
-def _minimal_wav_bytes() -> bytes:
-    """Returns ~0.1 s of silence as a valid WAV bytes object."""
-    buf = io.BytesIO()
-    with wave.open(buf, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)   # 16-bit
-        wf.setframerate(16000)
-        # 1600 frames = 0.1 s of silence
-        wf.writeframes(b"\x00\x00" * 1600)
-    return buf.getvalue()
-
-
 # ---------------------------------------------------------------------------
 # Server fixture factory
 # ---------------------------------------------------------------------------
@@ -97,7 +81,7 @@ async def _start_server(servicer, port: int):
 
 @pytest_asyncio.fixture
 async def hair_color_server():
-    async for s in _start_server(HairColorServicer(), 50151):  # offset ports to avoid conflicts
+    async for s in _start_server(HairAnalysisServicer(), 50151):  # offset ports to avoid conflicts
         yield s
 
 @pytest_asyncio.fixture
@@ -108,16 +92,6 @@ async def body_build_server():
 @pytest_asyncio.fixture
 async def people_count_server():
     async for s in _start_server(PeopleCountServicer(), 50153):
-        yield s
-
-@pytest_asyncio.fixture
-async def captions_server():
-    async for s in _start_server(CaptionsServicer(), 50154):
-        yield s
-
-@pytest_asyncio.fixture
-async def audio_server():
-    async for s in _start_server(AudioServicer(), 50155):
         yield s
 
 
@@ -179,24 +153,4 @@ async def test_people_count_mcp(people_count_server):
         "localhost:50153",
         _minimal_png_bytes(),
         "image",
-    )
-
-
-@pytest.mark.asyncio
-async def test_captions_mcp(captions_server):
-    """captions MCP returns a valid FeatureResponse for a tiny PNG."""
-    await _assert_valid_response(
-        "localhost:50154",
-        _minimal_png_bytes(),
-        "image",
-    )
-
-
-@pytest.mark.asyncio
-async def test_audio_mcp(audio_server):
-    """audio MCP returns a valid FeatureResponse for a short WAV clip."""
-    await _assert_valid_response(
-        "localhost:50155",
-        _minimal_wav_bytes(),
-        "audio",
     )

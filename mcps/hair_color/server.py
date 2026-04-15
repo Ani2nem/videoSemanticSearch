@@ -56,6 +56,12 @@ from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision as mp_vision
 
 try:
+    from ultralytics import YOLO as _YOLO_CLASS  # type: ignore
+    _YOLO_AVAILABLE = True
+except ImportError:
+    _YOLO_AVAILABLE = False
+
+try:
     import mcp_pb2
     import mcp_pb2_grpc
 except ImportError as exc:
@@ -155,6 +161,16 @@ _FACE_DET_URL = (
 _TEXTURE_MODEL = None
 _TEXTURE_DEVICE = None
 _TEXTURE_TRANSFORM = None
+_yolo_model = None
+_PERSON_CLASS_ID = 0
+
+
+def _get_yolo():
+    global _yolo_model  # noqa: PLW0603
+    if _yolo_model is None and _YOLO_AVAILABLE:
+        _yolo_model = _YOLO_CLASS("yolov8n.pt")
+        logger.info("YOLOv8n loaded for hair_color MCP")
+    return _yolo_model
 
 
 def _load_texture_model(
@@ -738,6 +754,8 @@ class HairAnalysisServicer(mcp_pb2_grpc.MCPServiceServicer):
         _load_texture_model()
         _load_hair_segmenter()
         _load_face_detector()
+        if _YOLO_AVAILABLE:
+            _get_yolo()
 
     async def ExtractFeatures(
         self,
@@ -819,13 +837,55 @@ def _run_extraction(image_bytes: bytes, source_id: str) -> dict:
     faces = det_result.detections
     logger.info("DEBUG - [%s] faces=%d", source_id, len(faces))
 
+    # Build a canonical list of (fx, fy, fw, fh) face anchors in global coords.
+    # Start from BlazeFace detections, then supplement with YOLO-derived anchors
+    # for any person whose face was missed by the face detector.
+    face_anchors: list[tuple[int, int, int, int]] = []
+    for det in faces:
+        bb = det.bounding_box
+        face_anchors.append((int(bb.origin_x), int(bb.origin_y), int(bb.width), int(bb.height)))
+
+    if _YOLO_AVAILABLE:
+        yolo = _get_yolo()
+        yolo_results = yolo(image, classes=[_PERSON_CLASS_ID], conf=0.35, iou=0.45, verbose=False)
+        person_boxes: list[tuple[int, int, int, int]] = []
+        for result in yolo_results:
+            for box in result.boxes:
+                px1, py1, px2, py2 = [int(v) for v in box.xyxy[0].tolist()]
+                person_boxes.append((px1, py1, px2, py2))
+
+        if len(person_boxes) > len(face_anchors):
+            logger.info(
+                "DEBUG - [%s] YOLO found %d person(s), BlazeFace found %d face(s) — "
+                "supplementing with YOLO anchors for uncovered persons",
+                source_id, len(person_boxes), len(face_anchors),
+            )
+            # For each YOLO person, check if any existing face anchor falls inside it.
+            # If not, synthesize a face anchor from the top 30% of the person bbox.
+            for (px1, py1, px2, py2) in person_boxes:
+                ph = py2 - py1
+                pw = px2 - px1
+                covered = any(
+                    px1 <= (fx + fw // 2) <= px2 and py1 <= (fy + fh // 2) <= py2
+                    for (fx, fy, fw, fh) in face_anchors
+                )
+                if not covered:
+                    # Synthesize face anchor: top 30% of person box, full width
+                    syn_h = max(10, int(ph * 0.30))
+                    face_anchors.append((px1, py1, pw, syn_h))
+                    logger.info(
+                        "DEBUG - [%s] Synthesized face anchor from YOLO bbox "
+                        "(%d,%d,%d,%d) → face anchor (%d,%d,%d,%d)",
+                        source_id, px1, py1, px2, py2,
+                        px1, py1, pw, syn_h,
+                    )
+
+    logger.info("DEBUG - [%s] total face anchors after YOLO supplement: %d", source_id, len(face_anchors))
+
     # ---- Step 3: Per-person ----
     people: list[dict] = []
 
-    for i, det in enumerate(faces):
-        bb = det.bounding_box
-        fx, fy = int(bb.origin_x), int(bb.origin_y)
-        fw, fh = int(bb.width), int(bb.height)
+    for i, (fx, fy, fw, fh) in enumerate(face_anchors):
 
         sx1 = max(0, fx - FACE_SEARCH_PAD_X)
         sy1 = max(0, fy - FACE_SEARCH_PAD_ABOVE)

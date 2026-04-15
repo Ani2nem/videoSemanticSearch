@@ -47,6 +47,12 @@ try:
 except ImportError:
     _CLIP_AVAILABLE = False
 
+try:
+    from ultralytics import YOLO  # type: ignore
+    _YOLO_AVAILABLE = True
+except ImportError:
+    _YOLO_AVAILABLE = False
+
 PORT = 50052
 
 logging.basicConfig(
@@ -107,6 +113,16 @@ _BUILD_KEYS = ["slim", "petite", "curvy", "athletic", "average", "plus_size"]
 _clip_model: Any = None
 _clip_processor: Any = None
 _build_text_embeds: Any = None
+_yolo_model: Any = None
+_PERSON_CLASS_ID = 0
+
+
+def _get_yolo():
+    global _yolo_model  # noqa: PLW0603
+    if _yolo_model is None and _YOLO_AVAILABLE:
+        _yolo_model = YOLO("yolov8n.pt")
+        logger.info("YOLOv8n model loaded for body_build")
+    return _yolo_model
 
 
 def _get_clip():
@@ -164,6 +180,8 @@ def _clip_classify_image(image: "Image.Image") -> tuple[str, float]:
 def _warm_up() -> None:
     _get_clip()
     _ensure_embeds()
+    if _YOLO_AVAILABLE:
+        _get_yolo()
 
 
 # ---------------------------------------------------------------------------
@@ -221,32 +239,54 @@ def _infer_body_build_sync(image_bytes: bytes) -> dict:
         return _mock_result()
 
     image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-
     _ensure_embeds()
 
-    try:
-        build, confidence = _clip_classify_image(image)
-    except Exception:
-        logger.exception("CLIP classification failed")
-        return _mock_result()
+    # Detect persons with YOLO, crop each one for individual classification.
+    crops: list[Image.Image] = []
+    if _YOLO_AVAILABLE:
+        yolo = _get_yolo()
+        results = yolo(image, classes=[_PERSON_CLASS_ID], conf=0.35, iou=0.45, verbose=False)
+        for result in results:
+            for box in result.boxes:
+                x1, y1, x2, y2 = [int(v) for v in box.xyxy[0].tolist()]
+                crops.append(image.crop((x1, y1, x2, y2)))
 
-    logger.info("Body build: %s (conf=%.4f)", build, confidence)
+    # Fallback: if no persons detected, classify the full image as one entry.
+    if not crops:
+        logger.info("No persons detected by YOLO — classifying full image")
+        crops = [image]
+
+    people = []
+    for idx, crop in enumerate(crops, start=1):
+        try:
+            build, confidence = _clip_classify_image(crop)
+        except Exception:
+            logger.exception("CLIP classification failed for person %d", idx)
+            build, confidence = "average", 0.0
+        people.append({
+            "person_id":  idx,
+            "body_build": build,
+            "confidence": confidence,
+        })
+        logger.info("Person %d: %s (conf=%.4f)", idx, build, confidence)
+
+    avg_conf = sum(p["confidence"] for p in people) / len(people)
 
     return {
         "data": {
-            "body_build": build,
-            "confidence": confidence,
+            "people":     people,
+            "count":      len(people),
             "using_mock": False,
         },
-        "confidence": confidence,
+        "confidence": avg_conf,
     }
 
 
 def _mock_result() -> dict:
     return {
         "data": {
-            "body_build": "athletic",
-            "confidence": 0.50,
+            "people": [{"person_id": 1, "body_build": "athletic", "confidence": 0.50}],
+            "count":  1,
             "using_mock": True,
         },
         "confidence": 0.50,

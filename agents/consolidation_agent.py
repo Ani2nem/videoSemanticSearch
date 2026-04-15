@@ -110,7 +110,7 @@ class ConsolidationAgent:
         """
         partial = any(
             not getattr(bundle.partial_flags, mcp)
-            for mcp in ("hair_color", "body_build", "people_count", "captions", "audio")
+            for mcp in ("hair_color", "body_build", "people_count", "race", "age")
         )
 
         system_prompt = _build_system_prompt()
@@ -227,8 +227,8 @@ def _build_user_prompt(bundle: ExtractionBundle) -> str:
     lines += _section_hair_color(bundle.hair_color, flags.hair_color)
     lines += _section("Body Build",   bundle.body_build,   flags.body_build)
     lines += _section("People Count", bundle.people_count, flags.people_count)
-    lines += _section("Captions/OCR", bundle.captions,     flags.captions)
-    lines += _section("Audio",        bundle.audio,        flags.audio)
+    lines += _section("Race",         bundle.race,         flags.race)
+    lines += _section("Age",          bundle.age,          flags.age)
 
     if bundle.extraction_errors:
         lines += ["", "=== EXTRACTION ERRORS ==="]
@@ -310,7 +310,7 @@ class MockConsolidationAgent(ConsolidationAgent):
         """
         partial = any(
             not getattr(bundle.partial_flags, mcp)
-            for mcp in ("hair_color", "body_build", "people_count", "captions", "audio")
+            for mcp in ("hair_color", "body_build", "people_count", "race", "age")
         )
 
         # Serialise the full bundle as the description so callers can see every
@@ -334,20 +334,16 @@ class MockConsolidationAgent(ConsolidationAgent):
             count = bundle.people_count.get("people_count")
             if count is not None:
                 tags.append(f"people:{count}")
-        if bundle.audio:
-            lang = bundle.audio.get("language")
-            if lang:
-                tags.append(f"lang:{lang}")
 
         # Confidence: 1.0 when all MCPs succeeded, reduced by 0.1 per failure.
         failed = sum(
-            1 for mcp in ("hair_color", "body_build", "people_count", "captions", "audio")
+            1 for mcp in ("hair_color", "body_build", "people_count", "race", "age")
             if not getattr(bundle.partial_flags, mcp)
         )
         confidence = round(max(0.0, 1.0 - failed * 0.1), 2)
 
         dominant: list[str] = [
-            mcp for mcp in ("hair_color", "body_build", "people_count", "captions", "audio")
+            mcp for mcp in ("hair_color", "body_build", "people_count", "race", "age")
             if getattr(bundle.partial_flags, mcp)
         ]
 

@@ -39,8 +39,8 @@ def _make_agent(overrides: dict | None = None) -> ExtractionAgent:
         "hair_color":   "localhost:59051",
         "body_build":   "localhost:59052",
         "people_count": "localhost:59053",
-        "captions":     "localhost:59054",
-        "audio":        "localhost:59055",
+        "race":         "localhost:59056",
+        "age":          "localhost:59057",
     }
     if overrides:
         addresses.update(overrides)
@@ -52,16 +52,13 @@ def _success_payload(name: str) -> dict:
 
 
 def _make_input(tmp_path) -> dict:
-    """Create a minimal test input with empty-but-existing sample files."""
+    """Create a minimal test input with an empty-but-existing sample image."""
     image_file = tmp_path / "frame.png"
-    audio_file = tmp_path / "clip.wav"
     image_file.write_bytes(b"\x89PNG\r\n\x1a\n")  # minimal PNG header
-    audio_file.write_bytes(b"RIFF")               # minimal WAV header
 
     return {
         "source_id":  "test-src-001",
         "image_path": str(image_file),
-        "audio_path": str(audio_file),
     }
 
 
@@ -92,42 +89,12 @@ async def test_soft_dependency_failure_does_not_raise(tmp_path):
     assert isinstance(bundle, ExtractionBundle)
     assert bundle.partial_flags.hair_color is False, "hair_color flag should be False"
     assert "hair_color" in bundle.extraction_errors
-    # Soft deps that succeeded should be set
     assert bundle.body_build   is not None
     assert bundle.people_count is not None
-    # Hard deps that succeeded should also be set
-    assert bundle.captions is not None
-    assert bundle.audio    is not None
 
 
 # ---------------------------------------------------------------------------
-# Test 2: Hard dependency failure (captions)
-# ---------------------------------------------------------------------------
-
-@pytest.mark.asyncio
-async def test_hard_dependency_failure_raises_extraction_error(tmp_path):
-    """
-    When captions MCP fails (hard dependency), ExtractionError must be raised.
-    """
-    agent = _make_agent()
-
-    async def mock_grpc_call(address, mcp_name, payload, payload_type, source_id):
-        if mcp_name == "captions":
-            raise RuntimeError("captions service down")
-        return _success_payload(mcp_name)
-
-    with patch.object(ExtractionAgent, "_grpc_call", new=AsyncMock(side_effect=mock_grpc_call)):
-        with patch("agents.extraction_agent.BACKOFF_DELAYS", (0.0, 0.0)):
-            with pytest.raises(ExtractionError) as exc_info:
-                await agent.process([_make_input(tmp_path)])
-
-    err = exc_info.value
-    assert err.mcp_name == "captions"
-    assert err.source_id == "test-src-001"
-
-
-# ---------------------------------------------------------------------------
-# Test 3: Circuit breaker opens after 5 consecutive failures
+# Test 2: Circuit breaker opens after 5 consecutive failures
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
@@ -161,7 +128,7 @@ async def test_circuit_breaker_opens_after_threshold(tmp_path):
                 try:
                     await agent.process([_make_input(tmp_path)])
                 except ExtractionError:
-                    pass  # audio/captions might also fail; we only care about the CB
+                    pass  # we only care about the body_build CB state, ignore other failures
 
     # Circuit must be open now
     assert cb.state == CBState.OPEN, f"Expected OPEN but got {cb.state}"
